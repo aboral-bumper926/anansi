@@ -1,5 +1,5 @@
 """
-Arachne — The spider that learns.
+Anansi — The spider that learns.
 
 Adaptive web scraping framework with self-healing selectors,
 anti-bot bypass, concurrent crawling, and MCP server integration.
