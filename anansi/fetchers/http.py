@@ -1,0 +1,378 @@
+"""Async HTTP fetcher backed by httpx with realistic headers and retry logic."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from typing import Any
+
+import httpx
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from anansi.fetchers.base import BaseFetcher, FetchResult
+from anansi.security import (
+    UnsafeURLError,
+    is_url_safe_for_public_fetch,
+)
+
+logger = logging.getLogger(__name__)
+
+# Maximum response body size accepted from a remote server. A hostile host could
+# stream multi-GB bodies to exhaust process memory; cap defensively.
+_DEFAULT_MAX_RESPONSE_BYTES = 50 * 1024 * 1024  # 50 MB
+# Cap on redirect chain length. httpx default is 20; we tighten it.
+_MAX_REDIRECTS = 5
+
+
+class ResponseTooLargeError(Exception):
+    """Raised when a response body exceeds the configured size cap."""
+
+
+class TooManyRedirectsError(Exception):
+    """Raised when a redirect chain exceeds ``_MAX_REDIRECTS``."""
+
+_QUICK_SPA_MARKERS = ("__NEXT_DATA__", "__NUXT__", "__INITIAL_STATE__", "__PRELOADED_STATE__", "__REDUX_STATE__")
+
+
+def _extract_spa(html: str) -> dict | None:
+    if not any(m in html for m in _QUICK_SPA_MARKERS):
+        return None
+    try:
+        from anansi.parser.structured import extract_spa_state
+        from bs4 import BeautifulSoup
+        return extract_spa_state(BeautifulSoup(html, "lxml")) or None
+    except Exception:
+        return None
+
+_RETRYABLE_STATUSES = {429, 502, 503, 504}
+
+
+class _RetryableStatus(Exception):
+    """Raised to trigger tenacity retry on 429/5xx responses."""
+
+# Browser-like accept headers per language (rotated)
+_ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.8,es;q=0.6",
+    "en-US,en;q=0.9,fr;q=0.8",
+]
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+
+
+def _build_headers(ua: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+class HTTPFetcher(BaseFetcher):
+    """
+    Lightweight async fetcher using httpx.
+
+    Rotates user-agents, sends realistic browser headers, follows redirects,
+    and retries on transient errors with exponential backoff.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_retries: int = 3,
+        timeout: float = 30.0,
+        follow_redirects: bool = True,
+        rotate_user_agents: bool = True,
+        http2: bool = True,
+        cookies: dict[str, str] | None = None,
+        impersonate: str | None = None,
+        max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
+        allow_private_networks: bool = False,
+    ) -> None:
+        self._max_retries = max_retries
+        self._timeout = timeout
+        self._follow_redirects = follow_redirects
+        self._rotate_ua = rotate_user_agents
+        self._http2 = http2
+        self._ua = random.choice(_USER_AGENTS)
+        self._client: httpx.AsyncClient | None = None
+        self._base_cookies = cookies or {}
+        self._session_cookies: dict[str, str] = {}
+        self._impersonate = impersonate
+        self._max_response_bytes = max_response_bytes
+        # When False, every redirect Location is run through the SSRF guard
+        # before the next hop is fetched. httpx's built-in auto-redirect is
+        # disabled in this mode so the check is not bypassed.
+        self._allow_private_networks = allow_private_networks
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                http2=self._http2,
+                # Auto-redirect is disabled so each Location can be re-validated
+                # by ``_follow_redirect_chain`` before the next hop is fetched.
+                follow_redirects=False,
+                timeout=httpx.Timeout(self._timeout),
+                cookies={**self._base_cookies, **self._session_cookies},
+            )
+        return self._client
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        proxy: str | None = None,
+        timeout: float | None = None,
+        **kwargs: Any,
+    ) -> FetchResult:
+        if self._rotate_ua:
+            self._ua = random.choice(_USER_AGENTS)
+
+        merged_headers = _build_headers(self._ua, headers)
+
+        if self._impersonate:
+            return await self._fetch_curl_cffi(
+                url, method=method, headers=merged_headers,
+                body=body, proxy=proxy, timeout=timeout or self._timeout,
+            )
+        return await self._fetch_httpx(
+            url, method=method, headers=merged_headers,
+            body=body, proxy=proxy, timeout=timeout or self._timeout,
+        )
+
+    async def _fetch_curl_cffi(
+        self,
+        url: str,
+        *,
+        method: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        proxy: str | None,
+        timeout: float,
+    ) -> FetchResult:
+        """Fetch using curl-cffi to mimic a real browser TLS fingerprint."""
+        try:
+            from curl_cffi.requests import AsyncSession
+        except ImportError:
+            logger.warning(
+                "curl-cffi is not installed; falling back to httpx "
+                "(install anansi[tls] for TLS fingerprint mimicry)"
+            )
+            self._impersonate = None
+            return await self._fetch_httpx(
+                url, method=method, headers=headers,
+                body=body, proxy=proxy, timeout=timeout,
+            )
+
+        proxies = {"https": proxy, "http": proxy} if proxy else None
+
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(self._max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=16),
+            retry=retry_if_exception_type(_RetryableStatus),
+            reraise=True,
+        ):
+            with attempt:
+                t0 = time.perf_counter()
+                async with AsyncSession(
+                    impersonate=self._impersonate,
+                    allow_redirects=True,
+                ) as session:
+                    resp = await session.request(
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        data=body,
+                        proxies=proxies,
+                        timeout=timeout,
+                    )
+                elapsed = time.perf_counter() - t0
+
+                if resp.status_code in _RETRYABLE_STATUSES:
+                    retry_after = int(resp.headers.get("Retry-After", 0))
+                    if retry_after > 0:
+                        await asyncio.sleep(retry_after)
+                    raise _RetryableStatus(f"HTTP {resp.status_code}")
+
+        # Persist session cookies for subsequent requests
+        for name, value in resp.cookies.items():
+            self._session_cookies[name] = value
+
+        body_text = resp.text
+        if len(body_text.encode("utf-8", errors="ignore")) > self._max_response_bytes:
+            raise ResponseTooLargeError(
+                f"response body exceeds cap {self._max_response_bytes}"
+            )
+        _spa = _extract_spa(body_text)
+        return FetchResult(
+            url=str(resp.url),
+            status=resp.status_code,
+            html=body_text,
+            headers=dict(resp.headers),
+            cookies={k: v for k, v in resp.cookies.items()},
+            elapsed=elapsed,
+            via_browser=False,
+            spa_state=_spa or None,
+        )
+
+    async def _fetch_httpx(
+        self,
+        url: str,
+        *,
+        method: str,
+        headers: dict[str, str],
+        body: bytes | None,
+        proxy: str | None,
+        timeout: float,
+    ) -> FetchResult:
+        """Fetch using httpx (standard path)."""
+        from urllib.parse import urljoin
+
+        client = await self._get_client()
+
+        # Rebuild client with proxy if needed (httpx doesn't support per-request proxy easily)
+        if proxy:
+            transport = httpx.AsyncHTTPTransport(proxy=proxy)
+            fetch_client = httpx.AsyncClient(
+                http2=self._http2,
+                # Auto-redirect off — the loop below validates each hop.
+                follow_redirects=False,
+                timeout=httpx.Timeout(timeout),
+                transport=transport,
+            )
+        else:
+            fetch_client = client
+
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(self._max_retries),
+                wait=wait_exponential(multiplier=1, min=1, max=16),
+                retry=retry_if_exception_type(
+                    (httpx.TransportError, httpx.TimeoutException, _RetryableStatus)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    t0 = time.perf_counter()
+                    # Manual redirect loop: re-validate Location at each hop so a
+                    # public host cannot redirect the fetcher into a private
+                    # address (SSRF). Capped at _MAX_REDIRECTS hops.
+                    current_url = url
+                    current_method = method
+                    current_body = body
+                    redirect_count = 0
+                    while True:
+                        resp = await fetch_client.request(
+                            method=current_method,
+                            url=current_url,
+                            headers=headers,
+                            content=current_body,
+                            timeout=timeout,
+                        )
+                        if (
+                            self._follow_redirects
+                            and resp.status_code in (301, 302, 303, 307, 308)
+                        ):
+                            loc = resp.headers.get("location")
+                            if not loc:
+                                break
+                            if redirect_count >= _MAX_REDIRECTS:
+                                raise TooManyRedirectsError(
+                                    f"redirect chain exceeded {_MAX_REDIRECTS} hops"
+                                )
+                            next_url = urljoin(str(resp.url), loc)
+                            try:
+                                is_url_safe_for_public_fetch(
+                                    next_url,
+                                    allow_private=self._allow_private_networks,
+                                )
+                            except UnsafeURLError:
+                                # Surface as a non-retryable failure so the
+                                # caller sees the rejection rather than a
+                                # tenacity retry storm.
+                                raise
+                            # 303 forces GET on the next hop; 301/302 historically
+                            # also coerce GET in practice. 307/308 preserve method.
+                            if resp.status_code in (301, 302, 303):
+                                current_method = "GET"
+                                current_body = None
+                            current_url = next_url
+                            redirect_count += 1
+                            continue
+                        break
+                    elapsed = time.perf_counter() - t0
+
+                    # Reject obviously-oversized responses before materializing the
+                    # body in memory. The Content-Length check is best-effort; the
+                    # body length is double-checked below for chunked responses.
+                    cl = resp.headers.get("content-length")
+                    if cl and cl.isdigit() and int(cl) > self._max_response_bytes:
+                        raise ResponseTooLargeError(
+                            f"response Content-Length {cl} exceeds cap "
+                            f"{self._max_response_bytes}"
+                        )
+
+                    if resp.status_code in _RETRYABLE_STATUSES:
+                        retry_after = int(resp.headers.get("Retry-After", 0))
+                        if retry_after > 0:
+                            await asyncio.sleep(retry_after)
+                        raise _RetryableStatus(f"HTTP {resp.status_code}")
+
+            # Persist session cookies for subsequent requests (skip proxy clients)
+            for name, value in resp.cookies.items():
+                self._session_cookies[name] = value
+            if not proxy and self._client and not self._client.is_closed:
+                for name, value in resp.cookies.items():
+                    self._client.cookies.set(name, value)
+
+            body_text = resp.text
+            if len(body_text.encode("utf-8", errors="ignore")) > self._max_response_bytes:
+                raise ResponseTooLargeError(
+                    f"response body exceeds cap {self._max_response_bytes}"
+                )
+            _spa = _extract_spa(body_text)
+            return FetchResult(
+                url=str(resp.url),
+                status=resp.status_code,
+                html=body_text,
+                headers=dict(resp.headers),
+                cookies={k: v for k, v in resp.cookies.items()},
+                elapsed=elapsed,
+                via_browser=False,
+                spa_state=_spa or None,
+            )
+        finally:
+            if proxy and fetch_client is not client:
+                await fetch_client.aclose()
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()

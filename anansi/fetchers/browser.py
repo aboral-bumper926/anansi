@@ -1,0 +1,579 @@
+"""
+Browser fetcher backed by Playwright.
+
+Features:
+- Persistent browser instance with a pooled context queue
+- Full stealth JS injection (webdriver flag, canvas/WebGL noise, plugin spoofing)
+- Cloudflare Turnstile & challenge detection with automatic wait
+- Human-like mouse movement via Bézier interpolation
+- Per-request proxy support via new browser contexts
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import random
+import time
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
+
+from anansi.fetchers.base import BaseFetcher, FetchResult
+
+logger = logging.getLogger(__name__)
+
+# ── Stealth JavaScript ────────────────────────────────────────────────────────
+
+_STEALTH_JS = """
+(function () {
+  // 1. Remove webdriver fingerprint
+  Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+  // 2. Spoof realistic plugins list
+  const fakePlugins = [
+    { name: 'Chrome PDF Plugin',     filename: 'internal-pdf-viewer',  description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer',     filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client',         filename: 'internal-nacl-plugin',  description: '' },
+  ];
+  const pluginArray = Object.create(PluginArray.prototype);
+  fakePlugins.forEach((p, i) => {
+    const plugin = Object.create(Plugin.prototype);
+    Object.defineProperties(plugin, {
+      name:        { get: () => p.name },
+      filename:    { get: () => p.filename },
+      description: { get: () => p.description },
+      length:      { get: () => 1 },
+    });
+    pluginArray[i] = plugin;
+  });
+  Object.defineProperties(pluginArray, {
+    length: { get: () => fakePlugins.length },
+    item:   { value: (i) => pluginArray[i] },
+    namedItem: { value: (name) => fakePlugins.find((_, i) => pluginArray[i].name === name) || null },
+    refresh: { value: () => {} },
+  });
+  Object.defineProperty(navigator, 'plugins', { get: () => pluginArray });
+
+  // 3. Languages
+  Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+  // 4. Hardware concurrency & device memory (realistic desktop values)
+  Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+  try { Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 }); } catch(_) {}
+
+  // 5. Chrome runtime object (expected by fingerprint checks)
+  if (!window.chrome) {
+    window.chrome = {
+      app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+      runtime: {
+        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+        OnRestartRequiredReason: { APP_UPDATE: 'app_update', GC_PRESSURE: 'gc_pressure', OS_UPDATE: 'os_update' },
+        PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+        PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+        RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+      },
+    };
+  }
+
+  // 6. Canvas fingerprint noise (tiny random perturbation per session)
+  const _noise = Math.random() * 0.05 - 0.025;
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, ...args) {
+    const ctx = origGetContext.call(this, type, ...args);
+    if (!ctx || type !== '2d') return ctx;
+    const origFillText  = ctx.fillText.bind(ctx);
+    const origStrokeText = ctx.strokeText.bind(ctx);
+    ctx.fillText   = (t, x, y, ...r) => origFillText(t, x + _noise, y + _noise, ...r);
+    ctx.strokeText = (t, x, y, ...r) => origStrokeText(t, x + _noise, y + _noise, ...r);
+    return ctx;
+  };
+
+  // 7. WebGL vendor/renderer noise
+  const origGetParam = WebGLRenderingContext.prototype.getParameter;
+  WebGLRenderingContext.prototype.getParameter = function (param) {
+    if (param === 37445) return 'Intel Inc.';
+    if (param === 37446) return 'Intel Iris OpenGL Engine';
+    return origGetParam.call(this, param);
+  };
+  try {
+    const origGetParam2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function (param) {
+      if (param === 37445) return 'Intel Inc.';
+      if (param === 37446) return 'Intel Iris OpenGL Engine';
+      return origGetParam2.call(this, param);
+    };
+  } catch(_) {}
+
+  // 8. Permissions API — report granted for notifications to look real
+  const origQuery = Permissions.prototype.query;
+  Permissions.prototype.query = function ({ name }) {
+    if (name === 'notifications') return Promise.resolve({ state: Notification.permission });
+    return origQuery.apply(this, arguments);
+  };
+
+  // 9. Screen dimensions consistent with a real desktop
+  Object.defineProperty(screen, 'width',     { get: () => 1920 });
+  Object.defineProperty(screen, 'height',    { get: () => 1080 });
+  Object.defineProperty(screen, 'colorDepth',{ get: () => 24 });
+
+  // 10. iframe contentWindow.navigator.webdriver fix
+  const origAttach = Element.prototype.attachShadow;
+  Element.prototype.attachShadow = function (...args) {
+    const root = origAttach.apply(this, args);
+    return root;
+  };
+})();
+"""
+
+# Cloudflare challenge indicators
+_CF_INDICATORS = [
+    "cf-turnstile",
+    "challenge-platform",
+    "cf_chl_opt",
+    "Cloudflare Ray ID",
+    "Please wait...",
+    "Just a moment",
+    "__cf_chl",
+]
+
+
+def _bezier_points(
+    x0: float, y0: float, x1: float, y1: float, steps: int = 12
+) -> list[tuple[float, float]]:
+    """Generate human-like mouse path via quadratic Bézier curve."""
+    cx = (x0 + x1) / 2 + random.uniform(-80, 80)
+    cy = (y0 + y1) / 2 + random.uniform(-80, 80)
+    pts = []
+    for i in range(steps + 1):
+        t = i / steps
+        bx = (1 - t) ** 2 * x0 + 2 * (1 - t) * t * cx + t ** 2 * x1
+        by = (1 - t) ** 2 * y0 + 2 * (1 - t) * t * cy + t ** 2 * y1
+        pts.append((bx, by))
+    return pts
+
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+]
+
+_VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 2560, "height": 1440},
+    {"width": 1440, "height": 900},
+    {"width": 1366, "height": 768},
+    {"width": 1280, "height": 800},
+]
+
+_HW_CONCURRENCY_OPTIONS = [4, 8, 12, 16]
+_DEVICE_MEMORY_OPTIONS = [4, 8, 16]
+
+# WebRTC leak mitigation — hides real IP even when behind a proxy
+_WEBRTC_BLOCK_JS = """
+(function() {
+  try {
+    Object.defineProperty(navigator, 'mediaDevices', { get: () => undefined });
+  } catch(_) {}
+  if (window.RTCPeerConnection) {
+    window.RTCPeerConnection = undefined;
+  }
+})();
+"""
+
+
+class BrowserFetcher(BaseFetcher):
+    """
+    Playwright-based fetcher with full stealth and anti-bot evasion.
+
+    Maintains a single persistent browser instance and a pool of contexts
+    to avoid the overhead of launching a browser per request.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_contexts: int = 5,
+        headless: bool = True,
+        timeout: float = 30.0,
+        cf_wait_timeout: float = 45.0,
+        channel: str = "chromium",
+        context_max_age: float = 300.0,
+        max_requests_per_context: int = 50,
+        insecure: bool = False,
+        sandbox: bool = True,
+    ) -> None:
+        self._max_contexts = max_contexts
+        self._headless = headless
+        self._timeout = timeout
+        self._cf_timeout = cf_wait_timeout
+        self._channel = channel
+        self._context_max_age = context_max_age
+        self._max_requests_per_context = max_requests_per_context
+        self._insecure = insecure
+        self._sandbox = sandbox
+        self._browser = None
+        self._playwright = None
+        self._context_semaphore: asyncio.Semaphore | None = None
+        self._context_pool: asyncio.Queue | None = None  # holds (ctx, created_at, req_count)
+        self._lock = asyncio.Lock()
+
+    async def _ensure_browser(self) -> None:
+        async with self._lock:
+            if self._browser is not None:
+                return
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--disable-dev-shm-usage",
+            ]
+            if not self._sandbox:
+                launch_args.insert(0, "--no-sandbox")
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._headless,
+                args=launch_args,
+            )
+            self._context_semaphore = asyncio.Semaphore(self._max_contexts)
+            self._context_pool: asyncio.Queue = asyncio.Queue(maxsize=self._max_contexts)
+
+    def _make_stealth_js(self, hw_concurrency: int, device_memory: int) -> str:
+        """Build the stealth script with randomised hardware values injected."""
+        return _STEALTH_JS.replace(
+            "{ get: () => 8 });",
+            f"{{ get: () => {hw_concurrency} }});",
+            1,
+        ).replace(
+            "{ get: () => 8 }); } catch(_) {}",
+            f"{{ get: () => {device_memory} }}); }} catch(_) {{}}",
+            1,
+        )
+
+    @asynccontextmanager
+    async def _get_context(
+        self, proxy: str | None = None
+    ) -> AsyncIterator[Any]:
+        await self._ensure_browser()
+        assert self._context_semaphore is not None
+        assert self._context_pool is not None
+
+        async with self._context_semaphore:
+            # Try to reuse an idle context (only when no proxy override)
+            ctx = None
+            created_at: float = 0.0
+            req_count: int = 0
+            if proxy is None:
+                try:
+                    ctx, created_at, req_count = self._context_pool.get_nowait()
+                    # Retire contexts that exceeded their age or request-count limit
+                    if (
+                        time.monotonic() - created_at > self._context_max_age
+                        or req_count >= self._max_requests_per_context
+                    ):
+                        await ctx.close()
+                        ctx = None
+                        req_count = 0
+                except asyncio.QueueEmpty:
+                    pass
+
+            if ctx is None:
+                proxy_cfg = {"server": proxy} if proxy else None
+                ua = random.choice(_USER_AGENTS)
+                viewport = random.choice(_VIEWPORTS)
+                hw = random.choice(_HW_CONCURRENCY_OPTIONS)
+                mem = random.choice(_DEVICE_MEMORY_OPTIONS)
+                ctx = await self._browser.new_context(
+                    user_agent=ua,
+                    viewport=viewport,
+                    proxy=proxy_cfg,
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    permissions=["geolocation"],
+                    java_script_enabled=True,
+                    ignore_https_errors=self._insecure,
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                )
+                await ctx.add_init_script(self._make_stealth_js(hw, mem))
+                await ctx.add_init_script(_WEBRTC_BLOCK_JS)
+                created_at = time.monotonic()
+                req_count = 0
+
+            # Reset per-origin state on every checkout so cookies / permissions
+            # set by a previous fetch on this pooled context cannot leak into
+            # the next one (potentially for a different origin).
+            try:
+                await ctx.clear_cookies()
+            except Exception:
+                pass
+            try:
+                await ctx.clear_permissions()
+            except Exception:
+                pass
+
+            try:
+                yield ctx
+            finally:
+                req_count += 1
+                if proxy is None:
+                    try:
+                        # Preserve original created_at so age is not reset on reuse
+                        self._context_pool.put_nowait((ctx, created_at, req_count))
+                    except asyncio.QueueFull:
+                        await ctx.close()
+                else:
+                    await ctx.close()
+
+    async def _simulate_human(self, page: Any) -> None:
+        """Move mouse in a human-like arc before interacting."""
+        x0, y0 = random.randint(100, 400), random.randint(100, 400)
+        x1, y1 = random.randint(400, 900), random.randint(200, 600)
+        for (bx, by) in _bezier_points(x0, y0, x1, y1):
+            await page.mouse.move(bx, by)
+            await asyncio.sleep(random.uniform(0.01, 0.03))
+
+    def _is_cloudflare_challenge(self, content: str) -> bool:
+        return any(indicator in content for indicator in _CF_INDICATORS)
+
+    async def _wait_for_cloudflare(self, page: Any) -> None:
+        """
+        Poll until the Cloudflare challenge clears or times out.
+        Also attempts to click the Turnstile checkbox if visible.
+        """
+        deadline = time.monotonic() + self._cf_timeout
+        while time.monotonic() < deadline:
+            # Try clicking the Turnstile iframe checkbox
+            try:
+                frame = next(
+                    (
+                        f for f in page.frames
+                        if "challenges.cloudflare.com" in (f.url or "")
+                    ),
+                    None,
+                )
+                if frame:
+                    checkbox = await frame.query_selector("input[type=checkbox]")
+                    if checkbox:
+                        await checkbox.click()
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+            content = await page.content()
+            if not self._is_cloudflare_challenge(content):
+                return
+
+        raise TimeoutError(f"Cloudflare challenge did not resolve within {self._cf_timeout}s")
+
+    async def _run_actions(self, page: Any, actions: list[dict[str, Any]]) -> None:
+        """Execute a sequence of browser interactions after the initial page load.
+
+        Each action may include ``required: false`` to make it optional — optional
+        action failures are logged as warnings and skipped rather than aborting the
+        fetch. Required actions (the default) raise RuntimeError on failure.
+
+        Two safety nets enforced here:
+        - Every ``selector`` is validated through ``validate_browser_selector``
+          to refuse Playwright engine prefixes (``xpath=``, ``text=``, …) and
+          chained ``>>`` selectors. MCP callers can therefore only address
+          elements with plain CSS.
+        - A cumulative wall-clock budget caps the total time spent across
+          ``wait`` and ``wait_for_selector`` actions so a thousand
+          ``{"type":"wait","ms":10000}`` entries cannot pin a Playwright
+          context indefinitely.
+        """
+        from anansi.security import validate_browser_selector
+        _MAX_BUDGET_MS = 60_000
+        spent_ms = 0
+        for i, action in enumerate(actions):
+            atype = action.get("type", "")
+            required = action.get("required", True)
+            try:
+                if atype == "click":
+                    sel = validate_browser_selector(action["selector"])
+                    await page.click(sel)
+                elif atype == "scroll_to_bottom":
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                elif atype == "fill":
+                    sel = validate_browser_selector(action["selector"])
+                    await page.fill(sel, action["value"])
+                elif atype == "wait":
+                    wait_ms = int(action.get("ms", 1000))
+                    if spent_ms + wait_ms > _MAX_BUDGET_MS:
+                        raise RuntimeError(
+                            f"action #{i} would exceed {_MAX_BUDGET_MS}ms wait budget"
+                        )
+                    spent_ms += wait_ms
+                    await asyncio.sleep(wait_ms / 1000)
+                elif atype == "wait_for_selector":
+                    sel = validate_browser_selector(action["selector"])
+                    remaining = _MAX_BUDGET_MS - spent_ms
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            f"action #{i} (wait_for_selector) starved by wait budget"
+                        )
+                    await page.wait_for_selector(sel, timeout=remaining)
+                    spent_ms = _MAX_BUDGET_MS  # treat as worst case
+                elif atype == "press":
+                    sel = validate_browser_selector(action["selector"])
+                    await page.press(sel, action["key"])
+            except Exception as exc:
+                if required:
+                    raise RuntimeError(
+                        f"Required browser action #{i} ({atype!r}) failed: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Optional browser action #%d (%r) failed — skipping: %s", i, atype, exc
+                )
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        proxy: str | None = None,
+        timeout: float | None = None,
+        wait_for: str | None = None,
+        wait_until: str = "domcontentloaded",
+        actions: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> FetchResult:
+        t0 = time.perf_counter()
+        effective_timeout = (timeout or self._timeout) * 1000  # ms
+
+        async with self._get_context(proxy) as ctx:
+            page = await ctx.new_page()
+            try:
+                if headers:
+                    await page.set_extra_http_headers(headers)
+
+                await self._simulate_human(page)
+
+                resp = await page.goto(
+                    url,
+                    wait_until=wait_until,
+                    timeout=effective_timeout,
+                )
+
+                await asyncio.sleep(random.uniform(0.8, 2.0))
+
+                content = await page.content()
+
+                if self._is_cloudflare_challenge(content):
+                    await self._wait_for_cloudflare(page)
+                    content = await page.content()
+
+                if wait_for:
+                    from anansi.security import validate_browser_selector
+                    sel = validate_browser_selector(wait_for)
+                    await page.wait_for_selector(sel, timeout=effective_timeout)
+                    content = await page.content()
+
+                if actions:
+                    await self._run_actions(page, actions)
+                    content = await page.content()
+
+                status = resp.status if resp else 200
+                resp_headers = dict(resp.headers) if resp else {}
+                cookies = {
+                    c["name"]: c["value"]
+                    for c in await ctx.cookies()
+                }
+
+                return FetchResult(
+                    url=page.url,
+                    status=status,
+                    html=content,
+                    headers=resp_headers,
+                    cookies=cookies,
+                    elapsed=time.perf_counter() - t0,
+                    via_browser=True,
+                )
+            finally:
+                await page.close()
+
+    async def screenshot(
+        self,
+        url: str,
+        *,
+        selector: str | None = None,
+        full_page: bool = False,
+        path: str | None = None,
+        proxy: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Capture a screenshot of *url* and return it as base64-encoded PNG.
+
+        Args:
+            url: Page to navigate to.
+            selector: If given, screenshot only the matching element.
+            full_page: Capture the full scrollable page (ignored when selector is set).
+            path: Optional file path to write the PNG to.
+            proxy: Proxy URL to use for this request.
+            timeout: Navigation timeout in seconds.
+
+        Returns:
+            {url, format, width, height, data_b64} or {url, format, path} when path is set.
+        """
+        import base64
+
+        t0 = time.perf_counter()
+        effective_timeout = (timeout or self._timeout) * 1000
+
+        async with self._get_context(proxy) as ctx:
+            page = await ctx.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=effective_timeout)
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                content = await page.content()
+                if self._is_cloudflare_challenge(content):
+                    await self._wait_for_cloudflare(page)
+
+                if selector:
+                    el = await page.query_selector(selector)
+                    if el is None:
+                        raise ValueError(f"Selector {selector!r} matched no element on {url}")
+                    png_bytes = await el.screenshot()
+                    box = await el.bounding_box()
+                    width = int(box["width"]) if box else 0
+                    height = int(box["height"]) if box else 0
+                else:
+                    png_bytes = await page.screenshot(full_page=full_page)
+                    vp = page.viewport_size or {}
+                    width = vp.get("width", 0)
+                    height = vp.get("height", 0)
+
+                result: dict[str, Any] = {
+                    "url": page.url,
+                    "format": "png",
+                    "width": width,
+                    "height": height,
+                    "elapsed": round(time.perf_counter() - t0, 3),
+                }
+                if path:
+                    import pathlib
+                    pathlib.Path(path).write_bytes(png_bytes)
+                    result["path"] = path
+                else:
+                    result["data_b64"] = base64.b64encode(png_bytes).decode()
+                return result
+            finally:
+                await page.close()
+
+    async def close(self) -> None:
+        if self._context_pool:
+            while not self._context_pool.empty():
+                ctx, _, _rc = await self._context_pool.get()
+                await ctx.close()
+        if self._browser:
+            await self._browser.close()
+            self._browser = None
+        if self._playwright:
+            await self._playwright.stop()
+            self._playwright = None
