@@ -1,7 +1,7 @@
 """
-Arachne MCP Server
+Anansi MCP Server
 
-Exposes Arachne's scraping capabilities as MCP tools so any LLM can
+Exposes Anansi's scraping capabilities as MCP tools so any LLM can
 fetch pages, extract structured data, run full crawls, and manage
 pause/resume — all through a clean tool interface.
 
@@ -136,7 +136,7 @@ def _cache_entry_bytes(chunks: list[str], meta: dict[str, Any]) -> int:
 mcp = FastMCP(
     name="anansi",
     instructions=textwrap.dedent("""
-        Arachne is an adaptive web scraping framework.
+        Anansi is an adaptive web scraping framework.
 
         You can use it to:
         - Fetch single pages (HTTP or headless browser with anti-bot bypass)
@@ -1100,7 +1100,7 @@ async def selector_health(
     Inspect the learned selector history for a URL pattern and field.
 
     Shows all known selectors sorted by confidence score, so you can see
-    which selectors Arachne has learned to use (or avoid) for a given page type.
+    which selectors Anansi has learned to use (or avoid) for a given page type.
 
     Args:
         url_pattern: Host + path pattern (e.g. "example.com/products/{id}").
@@ -1207,7 +1207,7 @@ async def train_selector(
     selector_type: str = "css",
 ) -> dict[str, Any]:
     """
-    Manually teach Arachne a correct CSS selector for a URL pattern and field.
+    Manually teach Anansi a correct CSS selector for a URL pattern and field.
 
     The selector is stored at confidence 1.0, making it the top candidate for
     future extractions on matching pages. Use this to pre-seed knowledge,
@@ -1316,7 +1316,7 @@ def run() -> None:
 
     parser = argparse.ArgumentParser(
         prog="anansi-mcp",
-        description="Arachne MCP server — expose web scraping tools to any LLM.",
+        description="Anansi MCP server — expose web scraping tools to any LLM.",
     )
     parser.add_argument(
         "--transport",
@@ -1339,7 +1339,7 @@ def run() -> None:
 
     if args.transport == "sse":
         print(
-            f"Arachne MCP server listening on http://{args.host}:{args.port}/sse",
+            f"Anansi MCP server listening on http://{args.host}:{args.port}/sse",
             flush=True,
         )
         try:
