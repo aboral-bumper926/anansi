@@ -7,6 +7,7 @@ import logging
 import random
 import time
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from tenacity import (
@@ -18,10 +19,7 @@ from tenacity import (
 
 from anansi import security
 from anansi.fetchers.base import BaseFetcher, FetchResult
-from anansi.security import (
-    UnsafeURLError,
-    is_url_safe_for_public_fetch,
-)
+from anansi.security import is_url_safe_for_public_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +145,22 @@ class HTTPFetcher(BaseFetcher):
         body: bytes | None = None,
         proxy: str | None = None,
         timeout: float | None = None,
+        referer: str | None = None,
         **kwargs: Any,
     ) -> FetchResult:
         if self._rotate_ua:
             self._ua = random.choice(_USER_AGENTS)
 
-        merged_headers = _build_headers(self._ua, headers)
+        # Inject a Referer only when the caller supplies one and has not
+        # already set it explicitly. Akamai (and similar) score a missing /
+        # mismatched Referer heavily; callers (crawler link-graph parent,
+        # single-shot origin) provide the value — the fetcher stays
+        # mechanism-only and never fabricates one.
+        extra = dict(headers) if headers else {}
+        if referer and not any(k.lower() == "referer" for k in extra):
+            extra["Referer"] = referer
+
+        merged_headers = _build_headers(self._ua, extra)
 
         if self._impersonate:
             return await self._fetch_curl_cffi(
@@ -163,6 +171,44 @@ class HTTPFetcher(BaseFetcher):
             url, method=method, headers=merged_headers,
             body=body, proxy=proxy, timeout=timeout or self._timeout,
         )
+
+    def _resolve_redirect(
+        self,
+        *,
+        status: int,
+        resp_url: str,
+        location: str | None,
+        method: str,
+        body: bytes | None,
+        redirect_count: int,
+    ) -> tuple[str, str, bytes | None] | None:
+        """Decide the next hop for a redirect, re-validating it against the
+        SSRF guard. Shared by the httpx and curl-cffi paths so neither can
+        smuggle a public→private redirect (the curl-cffi path previously used
+        ``allow_redirects=True`` and bypassed this check entirely).
+
+        Returns ``(next_url, next_method, next_body)`` or ``None`` when the
+        response is not a redirect to follow. Raises ``UnsafeURLError`` /
+        ``TooManyRedirectsError`` exactly like the original httpx loop.
+        """
+        if not (self._follow_redirects and status in (301, 302, 303, 307, 308)):
+            return None
+        if not location:
+            return None
+        if redirect_count >= _MAX_REDIRECTS:
+            raise TooManyRedirectsError(
+                f"redirect chain exceeded {_MAX_REDIRECTS} hops"
+            )
+        next_url = urljoin(resp_url, location)
+        # Raises UnsafeURLError (non-retryable) if the hop is unsafe.
+        is_url_safe_for_public_fetch(
+            next_url, allow_private=security.ALLOW_PRIVATE_NETWORKS
+        )
+        # 303 forces GET; 301/302 historically also coerce GET in practice.
+        # 307/308 preserve method + body.
+        if status in (301, 302, 303):
+            return next_url, "GET", None
+        return next_url, method, body
 
     async def _fetch_curl_cffi(
         self,
@@ -212,18 +258,43 @@ class HTTPFetcher(BaseFetcher):
         ):
             with attempt:
                 t0 = time.perf_counter()
+                # Send the accumulated cookie jar. Without this every
+                # impersonate request is "cold" — Akamai/DataDome behavioral
+                # scoring hard-blocks requests with no _abck / bm_sz / session
+                # state. Response cookies are harvested below so continuity
+                # holds across calls on the same HTTPFetcher.
+                request_cookies = {**self._base_cookies, **self._session_cookies}
+                # allow_redirects=False so every Location is re-validated by
+                # the shared SSRF-checked redirect loop (parity with the httpx
+                # path; impersonate must not weaken the SSRF guard).
                 async with AsyncSession(
                     impersonate=self._impersonate,
-                    allow_redirects=True,
+                    allow_redirects=False,
                 ) as session:
-                    resp = await session.request(
-                        method=method,
-                        url=url,
-                        headers=headers,
-                        data=body,
-                        proxies=proxies,
-                        timeout=timeout,
-                    )
+                    cur_url, cur_method, cur_body = url, method, body
+                    redirect_count = 0
+                    while True:
+                        resp = await session.request(
+                            method=cur_method,
+                            url=cur_url,
+                            headers=headers,
+                            data=cur_body,
+                            cookies=request_cookies or None,
+                            proxies=proxies,
+                            timeout=timeout,
+                        )
+                        nxt = self._resolve_redirect(
+                            status=resp.status_code,
+                            resp_url=str(resp.url),
+                            location=resp.headers.get("location"),
+                            method=cur_method,
+                            body=cur_body,
+                            redirect_count=redirect_count,
+                        )
+                        if nxt is None:
+                            break
+                        cur_url, cur_method, cur_body = nxt
+                        redirect_count += 1
                 elapsed = time.perf_counter() - t0
 
                 if resp.status_code in _RETRYABLE_STATUSES:
@@ -264,8 +335,6 @@ class HTTPFetcher(BaseFetcher):
         timeout: float,
     ) -> FetchResult:
         """Fetch using httpx (standard path)."""
-        from urllib.parse import urljoin
-
         client = await self._get_client()
 
         # Rebuild client with proxy if needed (httpx doesn't support per-request proxy easily)
@@ -307,37 +376,19 @@ class HTTPFetcher(BaseFetcher):
                             content=current_body,
                             timeout=timeout,
                         )
-                        if (
-                            self._follow_redirects
-                            and resp.status_code in (301, 302, 303, 307, 308)
-                        ):
-                            loc = resp.headers.get("location")
-                            if not loc:
-                                break
-                            if redirect_count >= _MAX_REDIRECTS:
-                                raise TooManyRedirectsError(
-                                    f"redirect chain exceeded {_MAX_REDIRECTS} hops"
-                                )
-                            next_url = urljoin(str(resp.url), loc)
-                            try:
-                                is_url_safe_for_public_fetch(
-                                    next_url,
-                                    allow_private=security.ALLOW_PRIVATE_NETWORKS,
-                                )
-                            except UnsafeURLError:
-                                # Surface as a non-retryable failure so the
-                                # caller sees the rejection rather than a
-                                # tenacity retry storm.
-                                raise
-                            # 303 forces GET on the next hop; 301/302 historically
-                            # also coerce GET in practice. 307/308 preserve method.
-                            if resp.status_code in (301, 302, 303):
-                                current_method = "GET"
-                                current_body = None
-                            current_url = next_url
-                            redirect_count += 1
-                            continue
-                        break
+                        nxt = self._resolve_redirect(
+                            status=resp.status_code,
+                            resp_url=str(resp.url),
+                            location=resp.headers.get("location"),
+                            method=current_method,
+                            body=current_body,
+                            redirect_count=redirect_count,
+                        )
+                        if nxt is None:
+                            break
+                        current_url, current_method, current_body = nxt
+                        redirect_count += 1
+                        continue
                     elapsed = time.perf_counter() - t0
 
                     # Reject obviously-oversized responses before materializing the

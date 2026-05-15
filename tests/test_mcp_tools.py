@@ -338,3 +338,80 @@ def test_env_bool_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _env_bool("ANANSI_TEST_FLAG") is False
     monkeypatch.delenv("ANANSI_TEST_FLAG", raising=False)
     assert _env_bool("ANANSI_TEST_FLAG") is False
+
+
+# ── impersonate plumbing (Phase 2) ────────────────────────────────────────────
+
+async def test_fetch_url_rejects_unknown_impersonate() -> None:
+    """An untrusted free-form impersonate value must be rejected before any
+    fetcher is constructed."""
+    import anansi.mcp_server.server as srv
+
+    with patch("anansi.mcp_server.server._validate_url"), \
+            patch("anansi.mcp_server.server._fetch_one",
+                  new=AsyncMock(return_value={})) as mock_fetch:
+        result = await srv.fetch_url("https://example.com", impersonate="'; rm -rf /")
+
+    assert "error" in result
+    assert "impersonate" in result["error"]
+    mock_fetch.assert_not_called()
+
+
+async def test_fetch_url_accepts_allowlisted_impersonate() -> None:
+    import anansi.mcp_server.server as srv
+
+    with patch("anansi.mcp_server.server._validate_url"), \
+            patch("anansi.mcp_server.server._fetch_one",
+                  new=AsyncMock(return_value={"ok": True})) as mock_fetch:
+        await srv.fetch_url("https://example.com", impersonate="chrome124")
+
+    assert mock_fetch.call_args.kwargs["impersonate"] == "chrome124"
+
+
+async def test_impersonate_env_default_applied(monkeypatch: pytest.MonkeyPatch) -> None:
+    import anansi.mcp_server.server as srv
+    from anansi import security
+
+    monkeypatch.setattr(security, "IMPERSONATE_DEFAULT", "chrome131")
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+    with patch("anansi.mcp_server.server._validate_url"), \
+            patch("anansi.mcp_server.server._fetch_one",
+                  new=AsyncMock(return_value={})) as mock_fetch:
+        await srv.fetch_url("https://example.com")
+
+    assert mock_fetch.call_args.kwargs["impersonate"] == "chrome131"
+
+
+def test_disable_antibot_overrides_impersonate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import anansi.mcp_server.server as srv
+    from anansi import security
+
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", True)
+    monkeypatch.setattr(security, "IMPERSONATE_DEFAULT", "chrome124")
+    # Even an explicit, allowlisted caller value resolves to None.
+    assert srv._resolve_impersonate("chrome124") is None
+    assert srv._resolve_impersonate(None) is None
+
+
+async def test_crawl_site_threads_impersonate(monkeypatch: pytest.MonkeyPatch) -> None:
+    import anansi.mcp_server.server as srv
+    from anansi import security
+
+    monkeypatch.setattr(security, "DISABLE_ANTIBOT", False)
+    captured = {}
+
+    class _FakeCrawler:
+        def __init__(self, *a, **kw):
+            captured.update(kw)
+
+    def _fake_create_task(coro, *a, **kw):
+        coro.close()  # avoid "coroutine was never awaited" warning
+        return MagicMock()
+
+    with patch("anansi.mcp_server.server._validate_url"), \
+            patch("anansi.spider.crawler.Crawler", _FakeCrawler), \
+            patch("anansi.mcp_server.server.asyncio.create_task",
+                  side_effect=_fake_create_task):
+        await srv.crawl_site("https://example.com", impersonate="chrome124")
+
+    assert captured.get("impersonate") == "chrome124"

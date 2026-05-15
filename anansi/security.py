@@ -33,6 +33,48 @@ ALLOW_PRIVATE_NETWORKS: bool = _env_bool("ANANSI_ALLOW_PRIVATE_NETWORKS")
 # Cloudflare-challenge waiting, curl-cffi TLS impersonation).
 DISABLE_ANTIBOT: bool = _env_bool("ANANSI_DISABLE_ANTIBOT")
 
+
+class InvalidImpersonateError(ValueError):
+    """Raised when a curl-cffi impersonation target is not in the allowlist."""
+
+
+# Curated subset of curl-cffi impersonation targets. The MCP client (an LLM)
+# is untrusted, so a free-form impersonate string must never reach curl-cffi
+# (unknown targets behave unpredictably and are a fingerprint-surprise vector).
+# Keep this consistent with the curl-cffi floor pinned in pyproject.toml
+# (>=0.7 — these targets are all supported there).
+IMPERSONATE_ALLOWLIST: frozenset[str] = frozenset({
+    "chrome116", "chrome119", "chrome120", "chrome123", "chrome124",
+    "chrome131", "chrome133", "chrome99_android",
+    "edge99", "edge101",
+    "safari15_5", "safari17_0", "safari17_2_ios", "safari18_0",
+})
+
+
+def validate_impersonate(value: str) -> str:
+    """Return *value* if it is an allowlisted curl-cffi target, else raise.
+
+    Used for both the untrusted per-call argument and the operator env
+    default (the latter so a typo'd ``ANANSI_IMPERSONATE`` fails loud at
+    resolution rather than as an opaque curl-cffi runtime error).
+    """
+    if value not in IMPERSONATE_ALLOWLIST:
+        raise InvalidImpersonateError(
+            f"impersonate target {value!r} not allowed; permitted: "
+            f"{sorted(IMPERSONATE_ALLOWLIST)}"
+        )
+    return value
+
+
+# Operator-only default impersonation target (e.g. ANANSI_IMPERSONATE=chrome124).
+# None = off (no behaviour change). Validated at import so a typo fails loud.
+# ANANSI_DISABLE_ANTIBOT always wins over this (resolved in the MCP layer).
+_impersonate_env = os.environ.get("ANANSI_IMPERSONATE", "").strip() or None
+if _impersonate_env is not None:
+    IMPERSONATE_DEFAULT: str | None = validate_impersonate(_impersonate_env)
+else:
+    IMPERSONATE_DEFAULT = None
+
 # ── SSRF guard ────────────────────────────────────────────────────────────────
 
 _ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
