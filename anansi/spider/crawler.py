@@ -319,7 +319,9 @@ class Crawler:
         auto_browser: bool = True,
         canonicalize_urls: bool = True,
         worker_timeout: float = 120.0,
+        impersonate: str | None = None,
     ) -> None:
+        self._impersonate = impersonate
         self._spider_cls = spider_class
         self._concurrency = concurrency
         self._delay = delay
@@ -806,7 +808,9 @@ class Crawler:
                     extra_headers["If-Modified-Since"] = cached["last_modified"]
 
         cookies_for_request = self._cookies if in_scope else {}
-        fetcher = self._fetcher or HTTPFetcher(cookies=cookies_for_request)
+        fetcher = self._fetcher or HTTPFetcher(
+            cookies=cookies_for_request, impersonate=self._impersonate
+        )
         result = await fetcher.fetch(url, proxy=proxy, headers=extra_headers or None)
 
         # Auto-browser: detect JS shell and retry with browser (E1)

@@ -28,6 +28,7 @@ from mcp.server.fastmcp import FastMCP
 from anansi.db import DATA_DIR
 from anansi import security
 from anansi.security import (
+    InvalidImpersonateError,
     OutOfRangeError,
     PathOutsideSandboxError,
     UnsafeRegexError,
@@ -37,6 +38,7 @@ from anansi.security import (
     is_url_safe_for_public_fetch,
     redact_userinfo,
     validate_browser_selector,
+    validate_impersonate,
     validate_proxy_url,
     validate_regex,
 )
@@ -92,6 +94,32 @@ def _validate_proxy(proxy: str | None) -> str | None:
         return None
     validate_proxy_url(proxy, allow_private=security.ALLOW_PRIVATE_NETWORKS)
     return proxy
+
+
+# Warn once at import (not per request) if the operator set conflicting env
+# flags. ANANSI_DISABLE_ANTIBOT always wins over ANANSI_IMPERSONATE.
+if security.DISABLE_ANTIBOT and security.IMPERSONATE_DEFAULT is not None:
+    logger.warning(
+        "Both ANANSI_DISABLE_ANTIBOT and ANANSI_IMPERSONATE are set; "
+        "anti-bot is disabled so impersonation will NOT be used."
+    )
+
+
+def _resolve_impersonate(value: str | None) -> str | None:
+    """Resolve the effective curl-cffi impersonation target.
+
+    Precedence: ANANSI_DISABLE_ANTIBOT (operator kill-switch) always wins and
+    forces None. Otherwise a caller-supplied value is validated against the
+    allowlist (the MCP client is untrusted) and used; if the caller passed
+    nothing, fall back to the operator ANANSI_IMPERSONATE default (already
+    validated at import). Raises ``InvalidImpersonateError`` for a bad
+    caller value; callers convert that into a structured tool error.
+    """
+    if security.DISABLE_ANTIBOT:
+        return None
+    if value is not None:
+        return validate_impersonate(value)
+    return security.IMPERSONATE_DEFAULT
 
 
 def _validate_url(url: str) -> None:
@@ -281,6 +309,7 @@ async def _fetch_one(
     chunk_size: int | None = None,
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """Fetch one URL, apply format conversion + chunking, and cache the result."""
     global _page_cache_bytes
@@ -313,7 +342,9 @@ async def _fetch_one(
                 )
         else:
             from anansi.fetchers.http import HTTPFetcher
-            async with HTTPFetcher(timeout=timeout) as fetcher:
+            async with HTTPFetcher(
+                timeout=timeout, impersonate=impersonate
+            ) as fetcher:
                 result = await fetcher.fetch(url, proxy=proxy, timeout=timeout)
 
         meta = {
@@ -381,6 +412,7 @@ async def fetch_url(
     chunk_size: int | None = None,
     chunk_index: int = 0,
     actions: list[dict[str, Any]] | None = None,
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a single URL and return its content.
@@ -410,6 +442,11 @@ async def fetch_url(
                  - {"type": "wait", "ms": 1500}
                  - {"type": "wait_for_selector", "selector": ".results"}
                  The final page HTML (after all actions) is returned.
+        impersonate: Optional curl-cffi browser TLS/HTTP-2 fingerprint target
+                     (e.g. "chrome124") for sites that fingerprint at the edge
+                     (Akamai/Cloudflare/DataDome). Must be an allowlisted
+                     target; ignored if the operator set ANANSI_DISABLE_ANTIBOT.
+                     Defaults to the operator's ANANSI_IMPERSONATE if unset.
 
     Returns:
         {url, status, content, format, content_length, chunk_index, total_chunks,
@@ -423,6 +460,10 @@ async def fetch_url(
         proxy = _validate_proxy(proxy)
     except UnsafeURLError as exc:
         return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
+    try:
+        impersonate = _resolve_impersonate(impersonate)
+    except InvalidImpersonateError as exc:
+        return {"error": f"invalid impersonate: {exc}"}
     if wait_for_selector is not None:
         try:
             validate_browser_selector(wait_for_selector)
@@ -438,6 +479,7 @@ async def fetch_url(
         chunk_size=chunk_size,
         chunk_index=chunk_index,
         actions=actions,
+        impersonate=impersonate,
     )
 
 
@@ -452,6 +494,7 @@ async def fetch_urls(
     format: str = "html",
     chunk_size: int | None = None,
     concurrency: int = 5,
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch multiple URLs in one call, returning results in the same order.
@@ -471,6 +514,10 @@ async def fetch_urls(
                     Only chunk 0 is returned per URL; use fetch_url with chunk_index
                     to retrieve subsequent chunks (served from cache).
         concurrency: Maximum simultaneous fetches (default 5).
+        impersonate: Optional allowlisted curl-cffi TLS/HTTP-2 fingerprint
+                     target (e.g. "chrome124") applied to every request;
+                     ignored under ANANSI_DISABLE_ANTIBOT; defaults to the
+                     operator's ANANSI_IMPERSONATE.
 
     Returns:
         {results: [...], total, succeeded, failed}
@@ -492,6 +539,10 @@ async def fetch_urls(
     except (OutOfRangeError, UnsafeURLError) as exc:
         return {"error": str(exc) if isinstance(exc, OutOfRangeError)
                 else f"unsafe proxy: {redact_userinfo(str(exc))}"}
+    try:
+        impersonate = _resolve_impersonate(impersonate)
+    except InvalidImpersonateError as exc:
+        return {"error": f"invalid impersonate: {exc}"}
 
     sem = asyncio.Semaphore(concurrency)
 
@@ -506,6 +557,7 @@ async def fetch_urls(
                     format=format,
                     chunk_size=chunk_size,
                     chunk_index=0,
+                    impersonate=impersonate,
                 )
             except Exception as exc:
                 return {"url": url, "error": str(exc), "status": None}
@@ -529,6 +581,7 @@ async def fetch_and_extract(
     use_browser: bool = False,
     proxy: str | None = None,
     timeout: float = 30.0,
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """
     Fetch a URL and extract structured data in a single tool call.
@@ -544,6 +597,9 @@ async def fetch_and_extract(
         use_browser: Use headless browser (bypasses Cloudflare, renders JS).
         proxy: Optional proxy URL.
         timeout: Request timeout in seconds.
+        impersonate: Optional allowlisted curl-cffi TLS/HTTP-2 fingerprint
+                     target (e.g. "chrome124"); ignored under
+                     ANANSI_DISABLE_ANTIBOT; defaults to ANANSI_IMPERSONATE.
 
     Returns:
         {url, status, elapsed, via_browser, data: {field: value, ...}}
@@ -552,12 +608,17 @@ async def fetch_and_extract(
         proxy = _validate_proxy(proxy)
     except UnsafeURLError as exc:
         return {"error": f"unsafe proxy: {redact_userinfo(str(exc))}"}
+    try:
+        impersonate = _resolve_impersonate(impersonate)
+    except InvalidImpersonateError as exc:
+        return {"error": f"invalid impersonate: {exc}"}
     result = await _fetch_one(
         url,
         use_browser=use_browser,
         proxy=proxy,
         timeout=timeout,
         format="html",
+        impersonate=impersonate,
     )
     if "error" in result:
         return result
@@ -635,6 +696,7 @@ async def crawl_site(
     deny_patterns: list[str] | None = None,
     max_duration_seconds: float | None = None,
     forward_credentials_cross_origin: bool = False,
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """
     Crawl a website and extract structured data from every page.
@@ -678,6 +740,11 @@ async def crawl_site(
                                           False; credentials are stripped on
                                           any request to a host not sharing
                                           start_url's registrable domain.
+        impersonate: Optional allowlisted curl-cffi TLS/HTTP-2 fingerprint
+                     target (e.g. "chrome124") applied to every HTTP fetch in
+                     the crawl, for edge-fingerprinting WAFs (Akamai/Cloudflare/
+                     DataDome). Ignored under ANANSI_DISABLE_ANTIBOT; defaults
+                     to the operator's ANANSI_IMPERSONATE.
 
     Returns:
         {crawl_id, status, message, start_url, max_pages}
@@ -700,6 +767,11 @@ async def crawl_site(
         _validate_url(start_url)
     except UnsafeURLError as exc:
         return {"error": f"unsafe start_url: {exc}"}
+
+    try:
+        impersonate = _resolve_impersonate(impersonate)
+    except InvalidImpersonateError as exc:
+        return {"error": f"invalid impersonate: {exc}"}
 
     # Validate regex inputs — link_pattern and each deny_pattern — against an
     # obvious-ReDoS heuristic and a length cap. Catastrophic-backtracking
@@ -799,6 +871,7 @@ async def crawl_site(
         auth_headers=auth_headers,
         credential_scope_host=scope_host,
         deduplicate_content=deduplicate_content,
+        impersonate=impersonate,
     )
     _active_crawlers[crawl_id] = crawler
 
